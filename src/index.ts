@@ -7,7 +7,7 @@ import * as fs from "fs";
 import { diffChars } from "diff";
 import inquirer from "inquirer";
 import { formatDiagnosticsWithColorAndContextTsFix, formatFixesInTheSameSpan, formatFixOnADifferentLocation } from "./utilities";
-import { exec } from 'child_process';
+import { execSync } from 'child_process';
 
 export interface Logger {
   (...args: any[]): void;
@@ -93,19 +93,29 @@ export interface Options {
   ignoreGitStatus: boolean
 }
 
-// Get git status from git repository
-// Note: Only works if the git repository folder matches tsconfig folder
-const getGitStatus = (dir: string) => new Promise<string>((resolve) => {
-  const dirPath = path.dirname(dir);
-  return exec(`git --git-dir="${path.join(dirPath, ".git")}" --work-tree="${dirPath}" status --porcelain`, (err, stdout) => {
-    if (err) {
-      throw new Error(err.message);
+// Get git status from git repository using synchronous calls.
+// Attempts to run in the directory of the tsconfig file first.
+// If that fails, attempts to find the git top-level directory and run there.
+const getGitStatus = (tsconfigPath: string): string => {
+    const initialCwd = path.dirname(tsconfigPath);
+    let statusOutput = "";
+
+    try {
+        // Attempt 1: Run git status in the initial directory
+        statusOutput = execSync(`git status --porcelain`, { cwd: initialCwd, encoding: 'utf8', stdio: 'pipe' });
+    } catch (initialError) {
+        // Attempt 1 failed, try finding the top-level directory
+        try {
+            const toplevelDir = execSync(`git rev-parse --show-toplevel`, { cwd: initialCwd, encoding: 'utf8', stdio: 'pipe' }).trim();
+            // Attempt 2: Found top-level, retry git status there
+            statusOutput = execSync(`git status --porcelain`, { cwd: toplevelDir, encoding: 'utf8', stdio: 'pipe' });
+        } catch (fallbackError) {
+            // Fallback failed (either rev-parse or second status)
+            statusOutput = ""; // Return empty string if any part of the fallback fails
+        }
     }
-    else if (typeof stdout === 'string') {
-      resolve(stdout.trim());
-    }
-  });
-});
+    return statusOutput.trim();
+};
 
 // Check git status and paths to provided files if applicable
 export const checkOptions = async (opt: Options): Promise<[string[], string[]]> => {
@@ -114,14 +124,23 @@ export const checkOptions = async (opt: Options): Promise<[string[], string[]]> 
   // Do not allow overwriting files with previous changes on them unless --ignoreGitStatus flag was provided
   if (!opt.ignoreGitStatus && opt.write && path.dirname(opt.tsconfig) === opt.outputFolder) {
     let isModified = false;
-    const status = await (getGitStatus(opt.tsconfig));
-    const splitStatus = status.split(/\r?\n/);
-    if (splitStatus.length && splitStatus[0] != '') {
-      const re = /[MARCD?]\s(package).+?(json)/g
-      isModified = splitStatus.length && splitStatus[0] !== '' ? !(splitStatus.filter((text) => { return text.match(re) }).length === splitStatus.length) : false;
-    }
+    const status = getGitStatus(opt.tsconfig); // Now synchronous
+
+    // Only check status if it's not empty (i.e., we are likely in a git repo)
+    if (status) {
+        const splitStatus = status.split(/\\r?\\n/).filter(line => line.trim() !== ''); // Filter empty lines
+        if (splitStatus.length > 0) {
+          // Regex to match package.json or package-lock.json at the start of the line status
+          const packageJsonRegex = /^[MARCD? ]+\s+package(-lock)?\.json$/;
+          // Check if there are modified files *other than* package*.json
+          const nonPackageJsonModified = splitStatus.some(line => !packageJsonRegex.test(line.trim()));
+          isModified = nonPackageJsonModified;
+        }
+    } // else: status is empty, assuming not a git repo or git failed, skip the check.
+
     if (isModified) {
-      throw new Error(`Please provide the --ignoreGitStatus flag if you are sure you'd like to override your existing changes`);
+      // Refined error message
+      throw new Error(`Git status indicates modified files potentially unrelated to package updates. Please commit or stash changes, or provide the --ignoreGitStatus flag if you are sure you'd like to proceed.`);
     }
   }
 
